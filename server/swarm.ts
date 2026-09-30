@@ -7,6 +7,7 @@ import type { LogEntry, SessionHandle, SessionResult } from './agentRunner.ts';
 import type { PrDetails } from './github.ts';
 import { defaultProjectsDir, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
+import { fixStep } from './fixOutcome.ts';
 import { HttpError } from './httpError.ts';
 import { CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
 import { DEFAULT_PREVIEW, Previews, parsePreviewPatch } from './previews.ts';
@@ -1697,7 +1698,7 @@ export class Swarm {
     if (result.interrupted) this.interrupted(a);
 
     if (a.task === 'qa') await this.onQaFinished(a, repo, result);
-    else if (a.task === 'fix') this.onFixFinished(a, repo, result);
+    else if (a.task === 'fix') await this.onFixFinished(a, repo, result);
     else await this.onIssueFinished(a, repo, result);
 
     this.emitAgent(a);
@@ -2074,7 +2075,7 @@ export class Swarm {
     this.startAgentSession(dev, repo, cwd, prompt, this.buildSystemAppend(dev, repo, cwd, headRef, { pr: rec.prNumber, headRef }), resume);
   }
 
-  private onFixFinished(a: PersistedAgent, repo: PersistedRepo, result: SessionResult) {
+  private async onFixFinished(a: PersistedAgent, repo: PersistedRepo, result: SessionResult) {
     const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === a.prNumber);
     if (a.status === 'stopped') {
       if (rec?.status === 'fixing') this.setQa(rec, { status: 'failed' });
@@ -2088,18 +2089,24 @@ export class Swarm {
       return;
     }
     a.status = 'done';
-    if (rec && (rec.fixReason === 'checks' || rec.fixReason === 'conflict')) {
-      // Back in line to merge: new commits go through QA again first, a re-run of flaky checks doesn't.
-      this.appendLog(a, [{ kind: 'done', text: `✔ PR #${a.prNumber} fixed in ${this.minutes(a)}m. Back in line to merge.` }]);
-      this.setQa(rec, { status: 'passed', devSessionId: a.sessionId ?? rec.devSessionId, mergeNote: 'waiting for fresh checks' });
-      this.toast('info', `${a.name} fixed PR #${rec.prNumber}; it merges once it passes again`);
+    if (!rec) {
+      this.appendLog(a, [{ kind: 'done', text: `✔ Fix pushed for PR #${a.prNumber} in ${this.minutes(a)}m. Back to QA.` }]);
       return;
     }
-    this.appendLog(a, [{ kind: 'done', text: `✔ Fix pushed for PR #${a.prNumber} in ${this.minutes(a)}m. Back to QA.` }]);
-    if (rec) {
-      this.setQa(rec, { status: 'queued', round: rec.round + 1, devSessionId: a.sessionId ?? rec.devSessionId });
-      this.toast('info', `${a.name} pushed fixes for PR #${rec.prNumber}; QA round ${rec.round} is queued`);
+    // Did it push anything? Checks fixes may just re-run a flaky check, so only QA and conflict fixes are asked.
+    let head: string | null = null;
+    if (rec.fixReason !== 'checks') {
+      try {
+        head = (await this.backend.prDetails(repo.fullName, rec.prNumber)).headSha;
+      } catch (err) {
+        this.appendLog(a, [{ kind: 'system', text: `⚠ Could not check PR #${rec.prNumber} for new commits: ${(err as Error).message.slice(0, 160)}` }]);
+      }
+      if (!this.state.qa.includes(rec)) return;
     }
+    const step = fixStep(rec, head, { agent: a.name, minutes: this.minutes(a), countFailure: !this.limited() });
+    this.appendLog(a, [step.log]);
+    this.setQa(rec, { ...step.set, devSessionId: a.sessionId ?? rec.devSessionId });
+    this.toast(step.toast.kind, step.toast.text);
   }
 
   /** A message for an agent: sent into their running session, or a follow-up that resumes it. typed: the manager typed it at their CLI's prompt, where it's already running. */

@@ -214,13 +214,15 @@ function fakeSession(opts: SessionOptions, cb: SessionCallbacks, fullName: strin
     }
     if (kind === 'fix') {
       const pr = repos.get(fullName)?.pulls.find((p) => p.number === number);
-      if (pr) {
+      // Now and then the push is forgotten, so the office's "no new commits" path shows too.
+      const pushed = Math.random() > 0.2;
+      if (pr && pushed) {
         pr.headSha = fakeSha();
         pr.mergeState = 'CLEAN';
         pr.mergeable = 'MERGEABLE';
-        runChecks(pr, false);
       }
-      cb.log([{ kind: 'text', text: `● Fixed PR #${number} and pushed. Ready for another QA round.` }]);
+      if (pr) runChecks(pr, false);
+      cb.log([{ kind: 'text', text: pushed ? `● Fixed PR #${number} and pushed. Ready for another QA round.` : `● Fixed PR #${number}. Ready for another QA round.` }]);
       cb.finished({ ok: true, text: '', costUsd, turns, errors: [] });
       return;
     }
