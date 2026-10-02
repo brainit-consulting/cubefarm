@@ -59,7 +59,8 @@ export interface SessionResult {
 export interface SessionCallbacks {
   log(entries: LogEntry[]): void;
   tool(name: string | null): void;
-  sessionId(id: string): void;
+  /** The session to resume next time; null: there's none to resume (the next session starts a new one). */
+  sessionId(id: string | null): void;
   browserUrl(url: string): void;
   screenshot(data: Buffer, mime: string): void;
   /** The final text of each turn: the reply to the prompt and to every message sent while it ran. */

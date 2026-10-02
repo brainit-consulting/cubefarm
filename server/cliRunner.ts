@@ -321,6 +321,20 @@ function idleHook(live: LiveCli, b: Record<string, unknown>): Record<string, unk
 
 // ---------- the session ----------
 
+/**
+ * The Claude Code session a hook reports, once its conversation is on disk: only then can --resume pick it up. Claude
+ * writes the file during the first turn, after SessionStart and UserPromptSubmit, so a session the office keeps any
+ * earlier could be one that never existed.
+ */
+export function resumableSession(b: Record<string, unknown>, exists: (file: string) => boolean): string | null {
+  const id = typeof b.session_id === 'string' ? b.session_id : '';
+  const file = typeof b.transcript_path === 'string' ? b.transcript_path : '';
+  return id && file && exists(file) ? id : null;
+}
+
+/** Claude Code was told to resume a conversation that isn't on disk (it says so and exits 1). */
+export const lostConversation = (screen: string) => /No conversation found with session ID/i.test(screen);
+
 export function startCliSession(opts: SessionOptions, callbacks: SessionCallbacks): SessionHandle {
   const term = opts.terminal!;
   // A follow-up to the session a CLI is still waiting in picks that CLI up again, and so does an office that restarted
@@ -342,6 +356,7 @@ export function startCliSession(opts: SessionOptions, callbacks: SessionCallback
   const officePrompts: string[] = []; // prompts the office typed, so the ones the manager typed are told apart
   const launched: string[] = []; // every prompt the CLI was given, as given (Codex: finds its main thread)
   let mainThread: string | null = opts.resumeSessionId ?? null;
+  let kept: string | null = opts.resumeSessionId ?? null; // the Claude session the agent has saved to resume
   const usageResets = new Map<string, number | null>();
   const warned = new Set<string>();
   let done = false;
@@ -450,6 +465,13 @@ export function startCliSession(opts: SessionOptions, callbacks: SessionCallback
   const hook = (b: Record<string, unknown>): Record<string, unknown> => {
     const event = String(b.hook_event_name ?? '');
     const sub = typeof b.agent_id === 'string' && b.agent_id !== ''; // a subagent's call: kept off the log
+    if (cli === 'claude' && !sub && b.session_id !== kept) {
+      const id = resumableSession(b, fs.existsSync);
+      if (id) {
+        kept = id;
+        cb.sessionId(id);
+      }
+    }
     switch (event) {
       case 'PreToolUse': {
         const name = String(b.tool_name ?? '');
@@ -552,6 +574,11 @@ export function startCliSession(opts: SessionOptions, callbacks: SessionCallback
 
   /** The CLI quit on its own: /exit typed in the terminal, a crash, or it couldn't start (not signed in, bad flag…). */
   const exited = (exitCode: number) => {
+    if (cli === 'claude' && opts.resumeSessionId && !begun && lostConversation(term.screen())) {
+      cb.sessionId(null);
+      finish({ ok: false, text: '', errors: [`${label} couldn't find the conversation it was resuming, so the next session starts a new one.`] });
+      return;
+    }
     const ok = exitCode === 0 && (lastText !== '' || (cli !== 'claude' && Date.now() - started > 20_000));
     finish({ ok, text: lastText, errors: ok ? [] : [`${label} exited${exitCode ? ` with code ${exitCode}` : ''} before finishing.`] });
   };
@@ -665,7 +692,7 @@ export function startCliSession(opts: SessionOptions, callbacks: SessionCallback
   }
   Object.assign(env, { TERM: 'xterm-256color', COLORTERM: 'truecolor' }, launch.env);
 
-  if (cli === 'claude') cb.sessionId(sessionId);
+  if (cli === 'claude' && opts.resumeSessionId) cb.sessionId(sessionId);
   term.note(`── ${label}${opts.label ? ` · ${opts.label}` : ''} ──`);
   const resumeId = cli === 'claude' ? sessionId : (opts.resumeSessionId ?? null);
   const l: LiveCli = { agentId: opts.agentId ?? '', cli, term, proc: null, token, dir, resumeId, statusLine, shots: new Set(), session: { hook, exited } };
